@@ -1,0 +1,3 @@
+#!/bin/sh
+
+[ -f /jffs/scripts/custom_ddns.sh ] && sh /jffs/scripts/custom_ddns.sh "$@" #Custom DDNS Updates#
