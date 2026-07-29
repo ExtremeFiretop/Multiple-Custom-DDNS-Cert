@@ -76,7 +76,9 @@ _freemyip_get_until_ok() {
   _fmi_url="$1"
   for i in $(seq 1 8); do
     _debug "HTTP GET freemyip.com API '$_fmi_url', retry $i/8..."
-    _get "$_fmi_url" | tee /proc/self/fd/2 | grep OK && return 0
+    _fmi_response="$(_get "$_fmi_url")"
+    printf '%s\n' "$_fmi_response" >&2
+    printf '%s\n' "$_fmi_response" | grep OK && return 0
     _sleep 1 # DO NOT send the request too fast
   done
   _err "Failed to request freemyip API: $_fmi_url . Server does not say 'OK'"
