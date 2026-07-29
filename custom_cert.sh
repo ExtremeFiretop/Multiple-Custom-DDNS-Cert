@@ -1,15 +1,17 @@
 #!/bin/sh
 #
-# FreeMyIP Let's Encrypt Cert Updater for Asuswrt-Merlin
-# Updated 2025-06-03
+# FreeMyIP Let's Encrypt Cert Updater for Asuswrt-Merlin
+# Updated 2026-07-29
 
 ###############################################################################
 # USER VARIABLES – adjust as required
 ###############################################################################
 FREEMYIP_DOMAIN2="DOMAIN2.freemyip.com"
+FREEMYIP_TOKEN2="XXXXXXXXXXXXXXXXXXXXXXXX"
 
-DESKTOP_IP="192.168.50.X"      # Only run when this host is online
-MAX_RETRIES=5                    # How many pings to try
+# Required exact variable name for the acme.sh dns_freemyip hook
+export FREEMYIP_Token="$FREEMYIP_TOKEN2"
+
 SLEEP_SECS=60                    # Wait time between retries (seconds)
 
 ACME_SH="/usr/sbin/acme.sh"
@@ -19,9 +21,10 @@ CERT_FILE="${CERT_DIR}/firetopcert.pem"
 
 SRC_DIR="${ACME_HOME}/${FREEMYIP_DOMAIN2}"
 ECC_DIR="${ACME_HOME}/${FREEMYIP_DOMAIN2}_ecc"
+DOMAIN_CONF="${ECC_DIR}/${FREEMYIP_DOMAIN2}.conf"
 
 ###############################################################################
-# HELPER – log to console *and* syslog, stripping any colours
+# HELPER – log to console and syslog, stripping any colours
 ###############################################################################
 Say() {
   local clean="$(echo "$1" | sed 's/\\\e\[[0-9;]*m//g')"
@@ -31,8 +34,6 @@ Say() {
 
 ###############################################################################
 # GLOBAL LOCK – prevent concurrent runs
-# Uses an atomic mkdir, which BusyBox supports.  /tmp is RAM-backed,
-# so any stale lock disappears on reboot.
 ###############################################################################
 LOCKDIR="/tmp/le_updater.lock"
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
@@ -46,7 +47,7 @@ cleanup_lock() {
 trap cleanup_lock EXIT INT TERM
 
 ###############################################################################
-# 0a  Skip if cert exists and is newer than 7 days
+# 0a  Skip if cert exists and is newer than 2 days
 ###############################################################################
 if [ -f "$CERT_FILE" ] && \
    [ -n "$(find "$CERT_FILE" -mtime -2 -print)" ]; then
@@ -57,94 +58,85 @@ fi
 ###############################################################################
 # Give the network a moment to settle before the desktop-reachability test
 ###############################################################################
-
 sleep "$SLEEP_SECS"
 
 ###############################################################################
-# 0  Check if desktop is online; wait-retry loop
-###############################################################################
-n=1
-while [ "$n" -le "$MAX_RETRIES" ]; do
-  if ping -c 1 -W 1 "$DESKTOP_IP" >/dev/null 2>&1; then
-    Say "[Check] $DESKTOP_IP reachable on attempt $n - proceeding with ACME."
-    break
-  fi
-
-  Say "[Check] $DESKTOP_IP not reachable (attempt $n/$MAX_RETRIES); waiting $SLEEP_SECS seconds"
-  if [ "$n" -lt "$MAX_RETRIES" ]; then
-    sleep "$SLEEP_SECS"
-  else
-    Say "[Aborted] $DESKTOP_IP never became reachable - skipping cert issuance."
-    exit 0           # Not an error; nothing to do this time
-  fi
-  n=$((n + 1))
-done
-
-###############################################################################
-# 1  Ensure working directories exist
+# 1  Ensure working directories exist
 ###############################################################################
 mkdir -p "$ACME_HOME" "$CERT_DIR"
 
 ###############################################################################
-# 2  Temporarily open validation ports
+# 2  Issue or renew the ECC certificate using DNS-01
 ###############################################################################
-iptables -I FORWARD -p tcp --dport 80   -j ACCEPT
-iptables -I INPUT   -p tcp --dport 8888 -j ACCEPT
-Say "[Firewall] Opened ports 80/8888 for Let's Encrypt validation"
-
-###############################################################################
-# 3  Issue or renew the ECC certificate
-###############################################################################
-Say "[LE] Issuing/renewing cert for $FREEMYIP_DOMAIN2"
+Say "[LE] Issuing/renewing cert for $FREEMYIP_DOMAIN2 using DNS-01"
 
 if [ -d "$ECC_DIR" ]; then
   #########################################################################
-  # Renewal path
+  # Existing certificate
   #########################################################################
-  Say "[LE] ECC dir found - attempting renewal"
-  $ACME_SH --renew -d "$FREEMYIP_DOMAIN2" \
-           --home "$ACME_HOME" \
-           --ecc --standalone \
-           --httpport 8888 --force
-  RET=$?
+
+  if [ -f "$DOMAIN_CONF" ] && \
+     grep -q "^Le_Webroot='dns_freemyip'" "$DOMAIN_CONF"; then
+
+    #######################################################################
+    # Already migrated: normal DNS-01 renewal
+    #######################################################################
+    Say "[LE] ECC dir found - attempting DNS-01 renewal"
+
+    "$ACME_SH" --renew -d "$FREEMYIP_DOMAIN2" \
+              --home "$ACME_HOME" \
+              --ecc --force
+
+    RET=$?
+  else
+    #######################################################################
+    # One-time migration from HTTP-01 to DNS-01
+    #######################################################################
+    Say "[LE] Existing certificate uses HTTP-01 - migrating to DNS-01"
+
+    "$ACME_SH" --issue -d "$FREEMYIP_DOMAIN2" \
+              --home "$ACME_HOME" \
+              --keylength ec-256 \
+              --dns dns_freemyip \
+              --force
+
+    RET=$?
+  fi
 
   if [ "$RET" -ne 0 ] && [ "$RET" -ne 2 ]; then
-    Say "[LE] Renewal failed (rc=$RET) - issuing a fresh cert as fallback"
-    $ACME_SH --issue -d "$FREEMYIP_DOMAIN2" \
-             --home "$ACME_HOME" \
-             --ecc --standalone \
-             --httpport 8888
+    Say "[LE] Renewal/migration failed (rc=$RET) - issuing a fresh cert as fallback"
+
+    "$ACME_SH" --issue -d "$FREEMYIP_DOMAIN2" \
+              --home "$ACME_HOME" \
+              --keylength ec-256 \
+              --dns dns_freemyip
+
     RET=$?
-    SOURCE_DIR="$SRC_DIR"
+    SOURCE_DIR="$ECC_DIR"
   else
-    Say "[LE] Renewal succeeded (or cert still valid)"
+    Say "[LE] Renewal/migration succeeded (or cert still valid)"
     SOURCE_DIR="$ECC_DIR"
   fi
 else
   #########################################################################
-  # First-time issuance path
+  # First-time issuance
   #########################################################################
-  Say "[LE] No existing ECC directory - issuing new cert"
-  $ACME_SH --issue -d "$FREEMYIP_DOMAIN2" \
-           --home "$ACME_HOME" \
-           --ecc --standalone \
-           --httpport 8888
+  Say "[LE] No existing ECC directory - issuing new cert with DNS-01"
+
+  "$ACME_SH" --issue -d "$FREEMYIP_DOMAIN2" \
+            --home "$ACME_HOME" \
+            --keylength ec-256 \
+            --dns dns_freemyip
+
   RET=$?
-  SOURCE_DIR="$SRC_DIR"
+  SOURCE_DIR="$ECC_DIR"
 fi
 
 ###############################################################################
-# 4  Close validation ports
-###############################################################################
-iptables -D FORWARD -p tcp --dport 80   -j ACCEPT
-iptables -D INPUT   -p tcp --dport 8888 -j ACCEPT
-Say "[Firewall] Closed ports 80/8888 after issuance"
-
-###############################################################################
-# 5  Post-processing and export
+# 3  Post-processing and export
 ###############################################################################
 if [ "$RET" -ne 0 ] && [ "$RET" -ne 2 ]; then
-  Say "[LE][Error] ACME issuance FAILED - Exiting"
+  Say "[LE][Error] ACME issuance FAILED - exiting"
   rm -rf "$SRC_DIR"
   exit 1
 fi
